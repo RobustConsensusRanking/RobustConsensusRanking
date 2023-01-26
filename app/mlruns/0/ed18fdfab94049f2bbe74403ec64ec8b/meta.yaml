@@ -1,0 +1,15 @@
+artifact_uri: file:///Users/m.goibert/Documents/Criteo/Projets_Recherche/P5_General_Depth_Fct/depth-functions/app/mlruns/0/ed18fdfab94049f2bbe74403ec64ec8b/artifacts
+end_time: 1650547700522
+entry_point_name: ''
+experiment_id: '0'
+lifecycle_stage: active
+name: ''
+run_id: ed18fdfab94049f2bbe74403ec64ec8b
+run_uuid: ed18fdfab94049f2bbe74403ec64ec8b
+source_name: ''
+source_type: 4
+source_version: ''
+start_time: 1650547700514
+status: 3
+tags: []
+user_id: m.goibert
