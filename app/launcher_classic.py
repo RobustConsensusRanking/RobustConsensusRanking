@@ -1,17 +1,10 @@
 import numpy as np
 import os
 from typing import NamedTuple
-import copy
 import torch
 import itertools
 import matplotlib.pyplot as plt
 from torch.distributions import MultivariateNormal, Normal
-from torch.optim.lr_scheduler import LambdaLR, ConstantLR, CyclicLR
-from torch.autograd import Variable
-from scipy.optimize import root_scalar, shgo
-import networkx as nx
-from scipy import optimize
-from math import factorial
 
 import argparse
 from utils._utils import get_logger
@@ -33,6 +26,9 @@ class Config(NamedTuple):
     norm_type_list: str = "1"
     ratio_list: str = "1.0"
     nb_simu_training_list: str = "25"
+    thresholds: str = "0.05"
+    gap_mode: str = "0.1"
+    mixture_val: str = "1"
 
 
 def str2bool(value):
@@ -43,13 +39,6 @@ def str2bool(value):
 
 
 def get_config():
-    '''
-    data = json({"n" : 4, "exp-types": Array("unimodal")},{"n" : 4, "exp-types": Array("unimodal")})
-    for exp in data : 
-        n = exp("n")
-    
-
-    '''
     parser = argparse.ArgumentParser(description="Parser")
     parser.add_argument("--n", type=int, default=4)
     parser.add_argument("--exp_types", type=str, default="unimodal")
@@ -61,6 +50,9 @@ def get_config():
     parser.add_argument("--norm_type_list", type=str, default="1")
     parser.add_argument("--ratio_list", type=str, default="1.0")
     parser.add_argument("--nb_simu_training_list", type=str, default="25")
+    parser.add_argument("--thresholds", type=str, default="0.05")
+    parser.add_argument("--gap_mode", type=str, default="0.1")
+    parser.add_argument("--mixture_val", type=str, default="1")
 
     args, _ = parser.parse_known_args()
 
@@ -73,6 +65,9 @@ def get_config():
     args.norm_type_list = np.array(list(map(str, str(args.norm_type_list).split(";"))))
     args.ratio_list = np.array(list(map(float, str(args.ratio_list).split(";"))))
     args.nb_simu_training_list = np.array(list(map(int, str(args.nb_simu_training_list).split(";"))))
+    args.thresholds = np.array(list(map(float, str(args.thresholds).split(";"))))
+    args.gap_mode = np.array(list(map(float, str(args.gap_mode).split(";"))))
+    args.mixture_val = np.array(list(map(float, str(args.mixture_val).split(";"))))
 
     max_len = np.max((args.exp_types.shape[0],args.seed_vals.shape[0],args.ms.shape[0],args.delta_list.shape[0],args.epochs_list.shape[0],args.dist_type_sym_list.shape[0],args.norm_type_list.shape[0],args.ratio_list.shape[0],args.nb_simu_training_list.shape[0]))
     args.exp_types = np.repeat(args.exp_types, int(max_len/args.exp_types.shape[0]))
@@ -84,6 +79,9 @@ def get_config():
     args.norm_type_list = np.repeat(args.norm_type_list, int(max_len/args.norm_type_list.shape[0]))
     args.ratio_list = np.repeat(args.ratio_list, int(max_len/args.ratio_list.shape[0]))
     args.nb_simu_training_list = np.repeat(args.nb_simu_training_list , int(max_len/args.nb_simu_training_list.shape[0]))
+    args.thresholds = np.repeat(args.thresholds, int(max_len / args.thresholds.shape[0]))
+    args.gap_mode = np.repeat(args.gap_mode, int(max_len / args.gap_mode.shape[0]))
+    args.mixture_val = np.repeat(args.mixture_val, int(max_len / args.mixture_val.shape[0]))
 
     return Config(**args.__dict__), args.__dict__
 
@@ -103,7 +101,6 @@ def pairwise_preference(sigma):
     return (inv < inv.T).astype(float)
 
 def pairwise_matrix(p_torch, torch_all_ranks, n=4):
-    #print(f"airwise mat n = {n}")
     all_rank = torch_all_ranks.detach().numpy()
     all_pairwises = np.array([pairwise_preference(sigma) for sigma in all_rank])
     if torch.is_tensor(p_torch):
@@ -232,65 +229,15 @@ class NewPhi(torch.autograd.Function):
         return back_ * grad_output, None, None, None, None, None, None
 
 
-def torch_optim_attack_relaxed(dist_Tp_Tq, p_torch, reg, epochs, std_dev=0.01, lr=0.01):
-    r"""
-    :param method: $\tau_K(T(p), T(q))$
-    :param reg: $\lambda$
-    :param epochs: limit on the number of optimization iterations
-    """
-    p_torch2 = p_torch.detach().clone()
-    p_torch2.requires_grad = False
-    softmax = torch.nn.Softmax(dim=0)
-    softplus = torch.nn.Softplus(beta=1, threshold=20)
-    kernel_conv = lambda _s: MultivariateNormal(_s, std_dev * torch.eye(_s.size()[-1]))  # $x\mapsto k_x(.)$
-    smoothed_dist_Tp_Tq = lambda p, q: smooth_pg_2(dist_Tp_Tq, kernel_conv)(p, q)  # $\phi(.,.)$
-
-    s_ = p_torch[0, :].detach().clone().to(device).type(default_tensor_type)
-    s_.requires_grad = True
-    optimizer = torch.optim.SGD([s_], lr=0.01, momentum=0.9)
-    scheduler = CyclicLR(optimizer, 0.01, 1.0, step_size_down=50, cycle_momentum=False)
-
-    for epoch in range(epochs):
-        optimizer.zero_grad()
-        q = softmax(s_)  # projection $\sum = 1$
-
-        # Decrease the approximation error over time
-        kernel_conv = lambda _s: MultivariateNormal(_s, std_dev * (10 / (10 + epoch)) * torch.eye(
-            _s.size()[-1]))  # $x\mapsto k_x(.)$
-        smoothed_dist_Tp_Tq = lambda p, q: smooth_pg_2(dist_Tp_Tq, kernel_conv)(p, q)  # $\phi(.,.)$
-
-        loss = -smoothed_dist_Tp_Tq(p_torch2, q) + reg * (
-            torch.norm(p_torch2 - q, 1))  # Lagrangian relaxation of the objective
-        loss.backward()
-        optimizer.step()
-        scheduler.step()
-
-    return q
-
-
 def subsample_fct(vect, time=10):
     l = len(vect)
     res = vect[0:l:time]
     return res
 
-
-def custom_scheduler(my_optimizer, lr, grad_data):
-    if (torch.abs(grad_data) > 20).any():
-        my_optimizer.param_groups[0]['lr'] = lr / 100
-    elif (torch.abs(grad_data) > 1.5).any():
-        my_optimizer.param_groups[0]['lr'] = lr * torch.log(torch.mean(torch.abs(grad_data))) / 10
-    elif (torch.abs(grad_data) > 0.5).any():
-        my_optimizer.param_groups[0]['lr'] = lr * torch.mean(torch.abs(grad_data)) / 1
-    else:
-        my_optimizer.param_groups[0]['lr'] = 10 * lr
-    return my_optimizer
-
-
 def plot_end_training(p_torch, dist_Tp_Tq, norms_, losses, mean_qs_, phis_, mean_phi2_, lambdas_, mean_lambdas_,
-                      grad_data, freq_phi_, norm_type):
+                      grad_data, norm_type):
     f, ax = plt.subplots(2, 2, figsize=(15, 8))
     ax[0, 0].plot(norms_)
-    # ax[0,0].set_ylim([-0.05, 2.05])
     ax[0, 0].set_title(f"Norm diff btw p and q")
 
     ax[0, 1].plot(phis_)
@@ -298,24 +245,20 @@ def plot_end_training(p_torch, dist_Tp_Tq, norms_, losses, mean_qs_, phis_, mean
     ax[0, 1].set_title(f"Phi")
 
     ax[1, 0].plot(lambdas_)
-    # ax[1,0].set_ylim([-0.05, 8.05])
     ax[1, 0].set_title(f"Lambda")
 
     ax[1, 1].plot(losses)
-    # ax[1,1].set_ylim([-10.05, 10.05])
     ax[1, 1].set_title(f"Loss")
     plt.show()
 
-    #logger.info("\n \n")
     time_fct = 100
     x_axis_val = subsample_fct(np.linspace(0, len(mean_lambdas_), len(mean_lambdas_)), time=time_fct)
     f, ax = plt.subplots(2, 2, figsize=(15, 8))
 
     mean_qs_subsample = subsample_fct(mean_qs_, time_fct)
     mean_qs1_ = [torch.norm(p_torch - torch.tensor(mean_q_), int(norm_type)) for mean_q_ in
-                 mean_qs_subsample]  # [mean_q_[0] for mean_q_ in mean_qs_]
+                 mean_qs_subsample]
     ax[0, 0].plot(x_axis_val, mean_qs1_)
-    # ax[0,0].set_ylim([-0.05, 1.05])
     ax[0, 0].set_title(f"Norm of the difference between p and q")
 
     Phi_ = NewPhi.apply
@@ -334,23 +277,16 @@ def plot_end_training(p_torch, dist_Tp_Tq, norms_, losses, mean_qs_, phis_, mean
     ax[1, 1].set_title(f"Loss")
     plt.plot()
 
-    #logger.info(f"Phi freq: {freq_phi_}")
 
-
-def approximate_breakdown_function(delta, dist_Tp_Tq, p_torch, epochs=150000, std_dev=0.01, lr=0.01, maxiter=10,
-                                   max_reg=10., eval_strat="real", norm_type="1", ratio_norm_=1.0, nb_simu_training=25):
-    softmax = torch.nn.Softmax(dim=0)
+def approximate_breakdown_function(delta, dist_Tp_Tq, p_torch, epochs=20000, lr=0.01,  norm_type="1", nb_simu_training=25):
     softplus = torch.nn.Softplus(beta=1, threshold=20)
-    # q = torch_optim_attack_relaxed(dist_Tp_Tq, p_torch, epochs=20, std_dev=std_dev, reg=10, lr=0.01)
-    # q2 = q.detach().clone()
-    q2 = p_torch.detach().clone().squeeze(0)  # q.detach().clone() #
+    q2 = p_torch.detach().clone().squeeze(0)
     q2.requires_grad = True
-    s_ = (-1-1)*torch.rand(q2.shape).to(device).type(default_tensor_type)+1.0 #q2[:].detach().clone().to(device).type(default_tensor_type)
+    s_ = (-1-1)*torch.rand(q2.shape).to(device).type(default_tensor_type)+1.0
     logger.info(f"Init val = {s_}")
     s_.requires_grad = True
 
     lambda_ = torch.tensor((1.0,), requires_grad=True)
-    qs_ = list()
     qs_total_ = list()
     lambdas_ = list()
     norms_ = list()
@@ -374,9 +310,8 @@ def approximate_breakdown_function(delta, dist_Tp_Tq, p_torch, epochs=150000, st
                                                          total_iters=30000)
 
     for epoch in range(epochs):
-        #try:
-        std_dev_training = 1e-3
-        std_dev_training_grad = 1e-1
+        std_dev_training = 1e-2
+        std_dev_training_grad = 1e-0
         kernel_conv = lambda _s: MultivariateNormal(_s, std_dev_training_grad * torch.eye(_s.size()[-1]))
         q2 = softplus(s_) / torch.sum(softplus(s_))
         res = smooth_pg_2(dist_Tp_Tq, kernel_conv)(p_torch, s_)
@@ -386,10 +321,7 @@ def approximate_breakdown_function(delta, dist_Tp_Tq, p_torch, epochs=150000, st
         phi_ = Phi_(q2, grad_data, p_torch, dist_Tp_Tq, std_dev_training, nb_simu_training, s_)
 
         # Norm: L1, L2, or something between the two
-        norm_ = torch.norm(p_torch - torch.unsqueeze(q2, 0), int(norm_type)) #ratio_norm_ * torch.norm(p_torch - torch.unsqueeze(q2, 0), int(norm_type)) + (
-                #    1.0 - ratio_norm_) * torch.norm(p_torch - torch.unsqueeze(q2, 0),
-                #                                    2 * int(norm_type) - 3 * (int(norm_type) - 1))
-
+        norm_ = torch.norm(p_torch - torch.unsqueeze(q2, 0), int(norm_type))
         optimizer_q2.zero_grad()
         optimizer_lambda.zero_grad()
 
@@ -409,8 +341,6 @@ def approximate_breakdown_function(delta, dist_Tp_Tq, p_torch, epochs=150000, st
 
         if int(epoch % (epochs / 10)) == 0:
             logger.info(f"Epoch = {epoch}")
-            #logger.info(
-            #    f"EPOCH {epoch}: \n \t q2={q2} \n \t s_={s_} \n \t grad = {-s_.grad.data} \n \t lr = {optimizer_q2.param_groups[0]['lr']} \n \t phi = {phi_} and std_dev = {std_dev_training} and norm diff = {norm_} \n \n \t lambda_={lambda_} and grad = {lambda_.grad.data} \n \t lr = {optimizer_lambda.param_groups[0]['lr']}")
         losses.append(loss.detach().item())
         qs_total_.append(q2.detach().numpy())
         norms_.append(norm_.item())
@@ -428,18 +358,12 @@ def approximate_breakdown_function(delta, dist_Tp_Tq, p_torch, epochs=150000, st
             mean_lambdas_.append(lambdas_[-1])
         else:
             mean_qs_.append((epoch + 1) / (epoch + 2) * mean_qs_[-1] + 1 / (epoch + 2) * qs_total_[
-                -1])  # mean_qs_.append(np.mean(qs_total_[0:], axis=0))
+                -1])
             mean_lambdas_.append((epoch + 1) / (epoch + 2) * mean_lambdas_[-1] + 1 / (epoch + 2) * lambdas_[
-                -1])  # mean_etas_.append(np.mean(etas_[0:]))
+                -1])
             mean_phi2_.append((epoch + 1) / (epoch + 2) * mean_phi2_[-1] + 1 / (epoch + 2) * phis_[-1])
-        #except:
-            #logger.info(f"Something went wrong")
-            #logger.info(
-            #    f"EPOCH {epoch}: \n \t q2={q2} \n \t s_={s_} and grad = {-s_.grad.data} \n \t lr = {optimizer_q2.param_groups[0]['lr']} \n \t phi = {phi_} and std_dev = {1.0 / (1 + epoch)} \n \n \t lambda_={lambda_} and grad = {lambda_.grad.data} \n \t lr = {optimizer_lambda.param_groups[0]['lr']}")
-        #    break
 
-    return norms_, losses, s_, qs_total_, mean_qs_, phis_, mean_phi2_, lambdas_, mean_lambdas_, grad_data, freq_phi_  # losses, qs_, lambdas_, s_, mean_qs_, mean_lambdas_ #epsilons_, etas_, alphas_, s_, mean_qs_, mean_epsilons_, mean_etas_, mean_alphas_
-
+    return norms_, losses, s_, qs_total_, mean_qs_, phis_, mean_phi2_, lambdas_, mean_lambdas_, grad_data, freq_phi_
 
 
 def proba_plackett_luce(w, all_ranks, n_items=4):
@@ -459,7 +383,6 @@ def proba_plackett_luce(w, all_ranks, n_items=4):
     return np.matrix(list_proba)
 
 
-#@torch.jit.script
 def _maxpair(P, threshold=0.):
     s = torch.sum(1 * (P > 0.5) + 1 / 2 * (P == 0.5), axis=1)
     sigma = torch.argsort(-s)
@@ -487,12 +410,8 @@ def maxpair(p, torch_all_ranks, n=4, threshold=0.):
     return _maxpair(P, threshold=threshold)
 
 
-@torch.jit.script #@njit
+@torch.jit.script
 def torch_merge_idx(M, idx):
-    # i,j \notin idx -> P_ij = M_ij
-    # i \in idx, j \notin idx -> P_ij = \max_{k\in idx} M_kj
-    # i \notin idx, j \in idx -> P_ij = \max_{k\in idx} M_ik
-    # i,j \in idx -> P_ij = 0.5
     P = M
     for i in torch.arange(M.shape[0]):
         m = torch.max(M[i, idx])
@@ -509,7 +428,6 @@ def torch_merge_idx(M, idx):
     P = PTRIU + torch.tril(1 - PTRIU.T, -1)
     return P
 
-#@torch.jit.script #@njit
 def merge(p, torch_all_ranks, threshold=0, n=4):
     P = pairwise_matrix(p, torch_all_ranks=torch_all_ranks, n=n)
     cont = True
@@ -533,165 +451,6 @@ def erm(p, torch_all_ranks, n=4):
     return torch.round(P)
 
 
-def kendall_tau(sigma1, sigma2):
-    n = sigma1.size()[-1]
-    sigma1_inv = torch.argsort(sigma1, dim=-1)
-    sigma2_inv = torch.argsort(sigma2, dim=-1)
-    sigma1_pairs = (sigma1_inv.unsqueeze(dim=-1) > sigma1_inv.unsqueeze(dim=-2)).float()
-    sigma2_pairs = (sigma2_inv.unsqueeze(dim=-1) > sigma2_inv.unsqueeze(dim=-2)).float()
-    return torch.sum(torch.abs(sigma1_pairs - sigma2_pairs), dim=[-2, -1]).double() / 2  # /(n*(n-1))
-
-
-def kendall_matrix(torch_all_ranks):
-    K = torch.zeros(len(torch_all_ranks), len(torch_all_ranks))
-    for i, rank1 in enumerate(torch_all_ranks):
-        for j, rank2 in enumerate(torch_all_ranks):
-            K[i, j] = kendall_tau(rank1, rank2)
-    return K.double()
-
-
-def get_all_buckets(torch_all_ranks, n=4):
-    list_bucket = list()
-
-    for rank1 in torch_all_ranks:
-        for rank2 in torch_all_ranks:
-            if kendall_tau(rank1, rank2) == 1.0:
-                list_bucket.append([rank1, rank2])
-
-    for i in np.arange(n):
-        temp_ranks = list()
-        for rank in torch_all_ranks:
-            if rank[3] == i:
-                temp_ranks.append(rank)
-        list_bucket.append(temp_ranks)
-
-    list_bucket.append([torch.tensor([0, 1, 2, 3]), torch.tensor([0, 1, 3, 2]), torch.tensor([1, 0, 2, 3]),
-                        torch.tensor([1, 0, 3, 2])])
-    list_bucket.append([torch.tensor([0, 2, 1, 3]), torch.tensor([0, 2, 3, 1]), torch.tensor([2, 0, 1, 3]),
-                        torch.tensor([2, 0, 3, 1])])
-    list_bucket.append([torch.tensor([0, 3, 1, 2]), torch.tensor([0, 3, 2, 1]), torch.tensor([3, 0, 1, 2]),
-                        torch.tensor([3, 0, 2, 1])])
-    list_bucket.append([torch.tensor([1, 2, 0, 3]), torch.tensor([1, 2, 3, 0]), torch.tensor([2, 1, 0, 3]),
-                        torch.tensor([2, 1, 3, 0])])
-    list_bucket.append([torch.tensor([1, 3, 0, 2]), torch.tensor([1, 3, 2, 0]), torch.tensor([3, 1, 0, 2]),
-                        torch.tensor([3, 1, 2, 0])])
-    list_bucket.append([torch.tensor([2, 3, 0, 1]), torch.tensor([2, 3, 1, 0]), torch.tensor([3, 2, 0, 1]),
-                        torch.tensor([3, 2, 1, 0])])
-
-    list_bucket.append(torch_all_ranks)
-    for rank in torch_all_ranks:
-        list_bucket.append(list([rank]))
-
-    return list_bucket
-
-
-def bucket_distrib(torch_all_ranks, list_bucket):
-    l_ = list()
-    div = len(list_bucket)
-    for a_ in torch_all_ranks:
-        count = 0
-        for b_ in list_bucket:
-            count += 1
-            if (b_ == a_).all():
-                l_.append(1.0 / div)
-                count += 1
-                continue
-        if count == div:
-            l_.append(0)
-    return torch.tensor(l_).double()
-
-
-def depth_metric_optim(p, K, list_bucket, torch_all_ranks, norm="l1", printer=False):
-    n_ranks_to_test = len(list_bucket)
-    val = torch.inf
-    for i, bucket in enumerate(list_bucket):
-        q = bucket_distrib(torch_all_ranks, bucket)
-        if norm == "l1":
-            val_ = torch.norm(torch.matmul(p.double(), K) - torch.matmul(q.double(), K), 1)
-        elif norm == "l2":
-            val_ = torch.norm(torch.matmul(p.double(), K) - torch.matmul(q.double(), K), 2)
-        #if printer:
-        #    logger.info(f"val: {val_} for {bucket}")
-        if val_ <= val:
-            best_distrib = q
-            val = val_
-    return best_distrib, val
-
-
-def depth(p, torch_all_ranks, norm="l1", printer=False):
-    list_bucket = get_all_buckets(torch_all_ranks, n=4)
-    K = kendall_matrix(torch_all_ranks)
-    q, val = depth_metric_optim(p, K, list_bucket, torch_all_ranks, norm=norm, printer=printer)
-    Q = pairwise_matrix(q.unsqueeze(0), torch_all_ranks=torch_all_ranks, n=4)
-    return Q
-
-
-def wasserstein_dist(p, q, K, n=4):
-    nsize = factorial(n)
-    K_bis = K.view(nsize * nsize)
-
-    for i in range(nsize):
-        A_ = [0] * nsize * i + [1] * nsize + [0] * nsize * (nsize - i - 1)
-        if i == 0:
-            A = torch.tensor(A_).reshape(1, nsize * nsize)
-        else:
-            A = torch.cat((A, torch.tensor(A_).reshape(1, nsize * nsize)))
-    for i in range(nsize):
-        A_ = ([0] * i + [1] + [0] * (nsize - i - 1)) * nsize
-        A = torch.cat((A, torch.tensor(A_).reshape(1, nsize * nsize)))
-
-    b = torch.cat((p, q), 1)
-
-    optim_val = optimize.linprog(K_bis, A_eq=A, b_eq=b, bounds=(0, 1))
-    return optim_val.fun
-
-
-def wasserstein_(myp, torch_all_ranks, n=4, printer=False):
-    list_bucket = get_all_buckets(torch_all_ranks, n=4)
-    K = kendall_matrix(torch_all_ranks)
-    val = torch.inf
-    for i, bucket in enumerate(list_bucket):
-        q = bucket_distrib(torch_all_ranks, bucket)
-        if len(q.shape) < 2:
-            q = q.unsqueeze(0)
-        val_ = wasserstein_dist(myp, q, K, n=n)
-        if val_ <= val:
-            best_distrib = q
-            val = val_
-    return best_distrib, val
-
-
-def wasserstein(myp, torch_all_ranks, n=4):
-    q, val = wasserstein_(myp, torch_all_ranks, n=n, printer=False)
-    Q = pairwise_matrix(q, torch_all_ranks=torch_all_ranks, n=n)
-    return Q
-
-
-
-
-
-
-
-
-#### LAUNCHER FUNCTIONS
-def get_automatic_thresholds(w):
-    p = proba_plackett_luce(w, all_ranks)
-    p_torch = torch.from_numpy(p)
-    torch_all_ranks = torch.from_numpy(np.asarray(all_ranks))
-    P = pairwise_matrix(p_torch, torch_all_ranks, n=4)
-    #logger.info(f"Pairwise mat: \n {P}")
-
-    m = torch.flatten(torch.triu(P, 1))
-    m = torch.sort(m[m != 0.0])[0]
-    minval = (m - 0.5)[0]
-    maxval = (m - 0.5)[-1]
-    thresholds_ = [0]
-    for val in list(np.linspace(minval - 0.0005, maxval + 0.0005, 21)):
-        thresholds_.append(val)
-    #logger.info(f"thresholds = {thresholds_}")
-    return thresholds_
-
-
 def torch_dist(dist, p_torch1, p_torch2, torch_all_ranks, threshold, dist_type_sym, n_items=4):
     if dist == "erm":
         R1 = erm(p_torch1, torch_all_ranks, n=n_items)
@@ -702,12 +461,6 @@ def torch_dist(dist, p_torch1, p_torch2, torch_all_ranks, threshold, dist_type_s
     elif dist == "merge":
         R1 = merge(p_torch1, torch_all_ranks, threshold=threshold, n=n_items)
         R2 = merge(p_torch2, torch_all_ranks, threshold=threshold, n=n_items)
-    elif dist == "depth":
-        R1 = depth(p_torch1, torch_all_ranks, norm="l1", printer=False)
-        R2 = depth(p_torch2, torch_all_ranks, norm="l1", printer=False)
-    elif dist == "wasserstein":
-        R1 = wasserstein(p_torch1, torch_all_ranks, n=n_items)
-        R2 = wasserstein(p_torch2, torch_all_ranks, n=n_items)
     if dist_type_sym:
         return symmetrized_hausdorff_on_kendall(R1, R2)
     else:
@@ -715,7 +468,7 @@ def torch_dist(dist, p_torch1, p_torch2, torch_all_ranks, threshold, dist_type_s
 
 
 def launch_exp(dist, p_torch, w, delta, thresholds_, epochs, save=True, dist_type_sym=True, norm_type="1",
-               ratio_norm_=1.0, nb_simu_training=25, exp_type="unimodal", n_items=4):
+               nb_simu_training=25, exp_type="unimodal", n_items=4):
     torch_all_ranks = torch.from_numpy(np.asarray(all_ranks))
     P = pairwise_matrix(p_torch, torch_all_ranks, n=n_items)
     
@@ -724,7 +477,7 @@ def launch_exp(dist, p_torch, w, delta, thresholds_, epochs, save=True, dist_typ
     alt_eps_list1 = []
     alt_eps_list2 = []
     perf_list = []
-    if dist in ["erm", "depth", "wasserstein"]:
+    if dist in ["erm"]:
         thresholds = [0.0]
     elif dist in ["maxpair", "merge"]:
         thresholds = thresholds_
@@ -747,10 +500,7 @@ def launch_exp(dist, p_torch, w, delta, thresholds_, epochs, save=True, dist_typ
                                                dist_type_sym=dist_type_sym, n_items=n_items)
 
         norms, losses, s_, qs_, mean_qs, phis, mean_phi2, lambdas, mean_lambdas, grad_data, freq_phi = approximate_breakdown_function(
-            delta - 1e-6, dist_Tp_Tq, p_torch, epochs=epochs, std_dev=0.001, lr=0.1, maxiter=21,
-            eval_strat="smoothed", norm_type=norm_type, ratio_norm_=ratio_norm_, nb_simu_training=nb_simu_training)
-        #plot_end_training(p_torch, dist_Tp_Tq, norms, losses, mean_qs, phis, mean_phi2, lambdas, mean_lambdas,
-        #                  grad_data, freq_phi, norm_type)
+            delta - 1e-6, dist_Tp_Tq, p_torch, epochs=epochs,  lr=0.1, norm_type=norm_type, nb_simu_training=nb_simu_training)
         dict_res_training = {"norms": norms, "losses": losses, "s_": s_, "qs_": qs_, "mean_qs": mean_qs, "phis": phis,
                              "mean_phi2": mean_phi2, "lambdas": lambdas, "mean_lambdas": mean_lambdas,
                              "grad_data": grad_data, "freq_phi": freq_phi}
@@ -770,8 +520,6 @@ def launch_exp(dist, p_torch, w, delta, thresholds_, epochs, save=True, dist_typ
         elif dist == "merge":
             stat_q2 = merge(torch.tensor(q2).unsqueeze(0), torch_all_ranks, threshold=threshold, n=n_items)
         logger.info(f"Res proba = {q2}\nRes Pairwise = {Q2}\nres stat = {stat_q2}")
-        #logger.info(
-        #    f"\n Found attack distrib q = {q2} (erm = {erm(torch.tensor(q2).unsqueeze(0), torch_all_ranks)}) OR \nq = {q1} (erm = {erm(torch.tensor(q1).unsqueeze(0), torch_all_ranks)})")  # and corresponding phi = {erm(q2, torch_all_ranks)} \n")
 
         eps_list1.append(torch.norm(p_torch - torch.tensor(q2).unsqueeze(0), 1))
         eps_list2.append(torch.norm(p_torch - torch.tensor(q2).unsqueeze(0), 2))
@@ -787,10 +535,6 @@ def launch_exp(dist, p_torch, w, delta, thresholds_, epochs, save=True, dist_typ
             Ptilde = maxpair(p_torch, torch_all_ranks, n=n_items, threshold=threshold)
         elif dist == "merge":
             Ptilde = merge(p_torch, torch_all_ranks, threshold=threshold, n=n_items)
-        elif dist == "depth":
-            Ptilde = depth(p_torch, torch_all_ranks, norm="l1", printer=False)
-        elif dist == "wasserstein":
-            Ptilde = wasserstein(p_torch, torch_all_ranks, n=4)
         logger.info(f"Statistic res = {Ptilde}")
         exp_kendall = expected_kendall(Ptilde, P).detach().item()
         perf_list.append(exp_kendall)
@@ -799,7 +543,7 @@ def launch_exp(dist, p_torch, w, delta, thresholds_, epochs, save=True, dist_typ
         directory = f"{os.getcwd()}/perf_robustness_profile/"+exp_type+"/"
         if not os.path.exists(directory):
             os.makedirs(directory)
-        filename = f"perf_robustness_dist={dist}_w={w}_delta={delta}_epochs={epochs}_dist_type_sym={dist_type_sym}_norm_L{norm_type}_ratio_{ratio_norm_}.pt"
+        filename = f"perf_robustness_dist={dist}_w={w}_delta={delta}_epochs={epochs}_dist_type_sym={dist_type_sym}_norm_L{norm_type}.pt"
         final_val_dict = {"thresholds": thresholds, "perf_list": perf_list, "eps_list1": eps_list1,
                           "eps_list2": eps_list2, "alt_eps_list1": alt_eps_list1, "alt_eps_list2": alt_eps_list1,
                           "p_torch": p_torch}
@@ -809,44 +553,11 @@ def launch_exp(dist, p_torch, w, delta, thresholds_, epochs, save=True, dist_typ
     return perf_list, eps_list1, eps_list2, alt_eps_list1, alt_eps_list2, dict_training
 
 
-def check_SST(P):
-    P = P.numpy()
-    cycles = list()
-    P2 = np.nan_to_num((P - 1 / 2).clip(0))
-    P2
-    G = nx.from_numpy_matrix(P2, create_using=nx.MultiDiGraph())
-    for cycle in nx.simple_cycles(G):
-        cycles.append(cycle)
-    if len(cycles) < 1:
-        logger.info("The distribution is SST")
-        res = True
-    else:
-        logger.info("The distribution is -NOT- SST")
-        res = False
-    return res
-
-
-def get_multimodal(ws, ratios, all_ranks):
-    torch_all_ranks = torch.from_numpy(np.asarray(all_ranks))
-    p_torch = torch.zeros((1, 24))
-    for (w, ratio) in zip(ws, ratios):
-        p_ = proba_plackett_luce(w, all_ranks)
-        p_torch_ = torch.from_numpy(p_)
-        logger.info(f"p_torch for w = {w}")
-        p_torch += ratio * p_torch_
-    P = pairwise_matrix(p_torch, torch_all_ranks, n=4)
-    #logger.info(P)
-    is_sst = check_SST(P)
-
-    return p_torch, P
-
-
 def main_exp_launcher(config):
     logger.info(f"nb seed = {config.seed_vals.shape} and nb m = {config.ms.shape}")
     n_items = config.n
     all_ranks = list(itertools.permutations(list(np.arange(n_items))))
     all_ranks = [np.array(elem) for elem in all_ranks]
-    torch_all_ranks = torch.from_numpy(np.asarray(all_ranks))
 
     for seed_val, exp_type, delta, epochs, dist_type_sym, norm_type, ratio_norm_, nb_simu_training, m in zip(config.seed_vals, config.exp_types, config.delta_list, config.epochs_list, config.dist_type_sym_list, config.norm_type_list, config.ratio_list, config.nb_simu_training_list, config.ms):
         torch.manual_seed(seed_val)
@@ -856,69 +567,29 @@ def main_exp_launcher(config):
         logger.info(f"\t \t \t M VAL = {m}")
 
         if exp_type == "unimodal":
-            softplus = torch.nn.Softplus(beta=1, threshold=20)
             logits = torch.sort(torch.randn(n_items), descending=True)[0].numpy()
             w = np.exp(logits) ** m
-            #w = softplus(torch.tensor(logits)).numpy()
             p = proba_plackett_luce(w, all_ranks)
             p_torch = torch.from_numpy(p)
-            P = pairwise_matrix(p_torch, torch_all_ranks, n=n_items)
             logger.info(f"w = {w}, p_torch = {p_torch}")
-        elif exp_type == "multimodal_sst":
-            logits1 = np.exp(torch.sort(torch.randn(n_items), descending=True)[0].numpy())
-            w1 = np.power(list(np.exp(logits1)), 5*m)
-            logits2 = torch.randn(4).numpy()
-            w2 = np.power(np.exp(logits2), m)
-            logits3 = torch.randn(4).numpy()
-            w3 = np.power(np.exp(logits3), m/2)
-            p_torch, P = get_multimodal(ws=[w1, w2, w3], ratios=[1/3, 1/3, 1/3], all_ranks=all_ranks)
-            w = f"multimodal_sst_m={m}_seed={seed_val}_n={n_items}"
-            logger.info(f"w = {w}, p_torch = {p_torch}")
+
         elif exp_type == "two_untied":
             import math
             p_torch = torch.zeros((1,math.factorial(n_items)))
-
-            logits = torch.sort(torch.randn(n_items), descending=True)[0].numpy()
-            w = np.exp(logits)
-            #p = proba_plackett_luce(w, all_ranks, n_items=n_items)
             n_fact = math.factorial(n_items)
             p = torch.rand(n_fact) 
             p /= torch.sum(p)
 
-            mixture_val = 0.95
-            gap_mode = 0.01
+            mixture_val = config.mixture_val
+            gap_mode = config.gap_mode
 
             p_torch[0,0] += (0.5+gap_mode)
             p_torch[0,1] += (0.5-gap_mode)
             p_torch = mixture_val*p_torch + (1-mixture_val)*p
-            P = pairwise_matrix(p_torch, torch_all_ranks, n=n_items)
             w = f"two_untied_mix={mixture_val}_gap={gap_mode}_seed={seed_val}"
 
         # THRESHOLDS
-        a = P[P>0.5].reshape(-1)#torch.triu(P, 1).reshape(-1)
-        a = a[a!=0.0]
-        a = a-0.5+1e-4
-        a = torch.sort(a)[0]
-        shape_val = a.shape[0]-1
-
-        for i, a_ in enumerate(a):
-            if i == 0:
-                inter = torch.tensor([np.linspace(0, a_, 10)[-2]])
-                a = torch.cat((inter, a))
-            elif int(i) >= shape_val:
-                #inter = torch.tensor(np.linspace(a_, a_+0.15, 5)[1:])
-                a = torch.cat((torch.tensor([0.5]), a))
-            else:
-                lin_ = np.linspace(a[i-1], a_, 10)
-                inter = torch.tensor([lin_[1], lin_[5]])
-                a = torch.cat((inter, a))
-        a = torch.unique(a)
-        a = a[a<0.5]
-        #thresholds_ = torch.sort(a)[0]
-        #thresholds_ = torch.tensor([0.0002, 0.001, 0.5])
-        #thresholds_ = torch.tensor([0.05, 0.101, 0.5])
-        #thresholds_ = torch.tensor([0.001, 0.0101, 0.5])
-        thresholds_ = torch.tensor([0.05])
+        thresholds_ = torch.tensor(config.thresholds)
         logger.info(f"thresholds = {thresholds_}")
 
         save = True
@@ -928,21 +599,14 @@ def main_exp_launcher(config):
         dist = "erm"
         perf_list_erm, eps_list_erm1, eps_list_erm2, alt_eps_list_erm1, alt_eps_list_erm2, dict_res_training_erm = launch_exp(
             dist, p_torch, w, delta, thresholds_, epochs, dist_type_sym=dist_type_sym, norm_type=norm_type,
-            ratio_norm_=ratio_norm_, nb_simu_training=nb_simu_training, save=save, exp_type=exp_type, n_items=n_items)
+            nb_simu_training=nb_simu_training, save=save, exp_type=exp_type, n_items=n_items)
 
         # Maxpair
         logger.info(f"\n Maxpair \n")
         dist = "maxpair"
         perf_list_maxpair, eps_list_maxpair1, eps_list_maxpair2, alt_eps_list_maxpair1, alt_eps_list_maxpair2, dict_res_training_maxpair = launch_exp(
             dist, p_torch, w, delta, thresholds_, epochs, dist_type_sym=dist_type_sym, norm_type=norm_type,
-            ratio_norm_=ratio_norm_, nb_simu_training=nb_simu_training, save=save, exp_type=exp_type, n_items=n_items)
-
-        # Merge
-        #logger.info(f"\n Merge \n")
-        #dist = "merge"
-        #perf_list_merge, eps_list_merge1, eps_list_merge2, alt_eps_list_merge1, alt_eps_list_merge2, dict_res_training_merge = launch_exp(
-        #    dist, p_torch, w, delta, thresholds_, epochs, dist_type_sym=dist_type_sym, norm_type=norm_type,
-        #    ratio_norm_=ratio_norm_, nb_simu_training=nb_simu_training, save=save, exp_type=exp_type, n_items=n_items)
+            nb_simu_training=nb_simu_training, save=save, exp_type=exp_type, n_items=n_items)
 
 
 if __name__ == "__main__":
