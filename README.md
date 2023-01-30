@@ -1,5 +1,4 @@
-## Robust Consensus in Ranking Data Analysis:
-Definitions, Properties and Computational Issues
+## Robust Consensus in Ranking Data Analysis: Definitions, Properties and Computational Issues
 
 #### What is this repo?
 This repository contains the code for the paper "Robust Consensus in Ranking Data Analysis:
