@@ -467,7 +467,7 @@ def torch_dist(dist, p_torch1, p_torch2, torch_all_ranks, threshold, dist_type_s
         return disymmetrized_hausdorff_on_kendall(R1, R2)
 
 
-def launch_exp(dist, p_torch, w, delta, thresholds_, epochs, save=True, dist_type_sym=True, norm_type="1",
+def launch_exp(all_ranks, dist, p_torch, w, delta, thresholds_, epochs, save=True, dist_type_sym=True, norm_type="1",
                nb_simu_training=25, exp_type="unimodal", n_items=4):
     torch_all_ranks = torch.from_numpy(np.asarray(all_ranks))
     P = pairwise_matrix(p_torch, torch_all_ranks, n=n_items)
@@ -588,6 +588,11 @@ def main_exp_launcher(config):
             p_torch = mixture_val*p_torch + (1-mixture_val)*p
             w = f"two_untied_mix={mixture_val}_gap={gap_mode}_seed={seed_val}"
 
+
+        elif exp_type == "sushi":
+            p_torch = torch.load("p_torch_sushi.pt")
+            w = f"sushi_seed={seed_val}"
+
         # THRESHOLDS
         thresholds_ = torch.tensor(config.thresholds)
         logger.info(f"thresholds = {thresholds_}")
@@ -598,14 +603,14 @@ def main_exp_launcher(config):
         logger.info(f"\n ERM \n")
         dist = "erm"
         perf_list_erm, eps_list_erm1, eps_list_erm2, alt_eps_list_erm1, alt_eps_list_erm2, dict_res_training_erm = launch_exp(
-            dist, p_torch, w, delta, thresholds_, epochs, dist_type_sym=dist_type_sym, norm_type=norm_type,
+            all_ranks, dist, p_torch, w, delta, thresholds_, epochs, dist_type_sym=dist_type_sym, norm_type=norm_type,
             nb_simu_training=nb_simu_training, save=save, exp_type=exp_type, n_items=n_items)
 
         # Maxpair
         logger.info(f"\n Maxpair \n")
         dist = "maxpair"
         perf_list_maxpair, eps_list_maxpair1, eps_list_maxpair2, alt_eps_list_maxpair1, alt_eps_list_maxpair2, dict_res_training_maxpair = launch_exp(
-            dist, p_torch, w, delta, thresholds_, epochs, dist_type_sym=dist_type_sym, norm_type=norm_type,
+            all_ranks, dist, p_torch, w, delta, thresholds_, epochs, dist_type_sym=dist_type_sym, norm_type=norm_type,
             nb_simu_training=nb_simu_training, save=save, exp_type=exp_type, n_items=n_items)
 
 
