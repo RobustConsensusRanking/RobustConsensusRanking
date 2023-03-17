@@ -69,7 +69,16 @@ def get_config():
     args.gap_mode = np.array(list(map(float, str(args.gap_mode).split(";"))))
     args.mixture_val = np.array(list(map(float, str(args.mixture_val).split(";"))))
 
-    max_len = np.max((args.exp_types.shape[0],args.seed_vals.shape[0],args.ms.shape[0],args.delta_list.shape[0],args.epochs_list.shape[0],args.dist_type_sym_list.shape[0],args.norm_type_list.shape[0],args.ratio_list.shape[0],args.nb_simu_training_list.shape[0]))
+    max_len = np.max((args.thresholds.shape[0],
+        args.exp_types.shape[0],
+        args.seed_vals.shape[0],
+        args.ms.shape[0],
+        args.delta_list.shape[0],
+        args.epochs_list.shape[0],
+        args.dist_type_sym_list.shape[0],
+        args.norm_type_list.shape[0],
+        args.ratio_list.shape[0],
+        args.nb_simu_training_list.shape[0]))
     args.exp_types = np.repeat(args.exp_types, int(max_len/args.exp_types.shape[0]))
     args.seed_vals = np.repeat(args.seed_vals, int(max_len/args.seed_vals.shape[0]))
     args.ms = np.repeat(args.ms, int(max_len/args.ms.shape[0]))
@@ -282,7 +291,7 @@ def approximate_breakdown_function(delta, dist_Tp_Tq, p_torch, epochs=20000, lr=
     softplus = torch.nn.Softplus(beta=1, threshold=20)
     q2 = p_torch.detach().clone().squeeze(0)
     q2.requires_grad = True
-    s_ = (-1-1)*torch.rand(q2.shape).to(device).type(default_tensor_type)+1.0
+    s_ = (-1)*torch.rand(q2.shape).to(device).type(default_tensor_type)+1.0
     logger.info(f"Init val = {s_}")
     s_.requires_grad = True
 
@@ -302,16 +311,16 @@ def approximate_breakdown_function(delta, dist_Tp_Tq, p_torch, epochs=20000, lr=
 
     lr_list = list()
 
-    optimizer_q2 = torch.optim.SGD([s_], lr=0.1*lr, weight_decay=0.0, momentum=0.1)
-    optimizer_lambda = torch.optim.SGD([lambda_], lr=1*lr, weight_decay=0.0, momentum=0.1, maximize=True)
+    optimizer_q2 = torch.optim.SGD([s_], lr=0.5*lr, weight_decay=0.0, momentum=0.1)
+    optimizer_lambda = torch.optim.SGD([lambda_], lr=10*lr, weight_decay=0.0, momentum=0.1, maximize=True)
 
-    scheduler_q2 = torch.optim.lr_scheduler.LinearLR(optimizer_q2, start_factor=1, end_factor=1 / 20, total_iters=30000)
-    scheduler_lambda = torch.optim.lr_scheduler.LinearLR(optimizer_lambda, start_factor=1, end_factor=1 / 20,
+    scheduler_q2 = torch.optim.lr_scheduler.LinearLR(optimizer_q2, start_factor=1, end_factor=1 / 50, total_iters=30000)
+    scheduler_lambda = torch.optim.lr_scheduler.LinearLR(optimizer_lambda, start_factor=1, end_factor=1 / 50,
                                                          total_iters=30000)
 
     for epoch in range(epochs):
-        std_dev_training = 1e-2
-        std_dev_training_grad = 1e-0
+        std_dev_training = 1e-3 #1e-2
+        std_dev_training_grad = 1e-1 #1e-0
         kernel_conv = lambda _s: MultivariateNormal(_s, std_dev_training_grad * torch.eye(_s.size()[-1]))
         q2 = softplus(s_) / torch.sum(softplus(s_))
         res = smooth_pg_2(dist_Tp_Tq, kernel_conv)(p_torch, s_)
@@ -335,7 +344,7 @@ def approximate_breakdown_function(delta, dist_Tp_Tq, p_torch, epochs=20000, lr=
         scheduler_lambda.step()
 
         with torch.no_grad():
-            if len(phis_) > 100 and np.min(delta - phis_[-100:]) < 0:
+            if len(phis_) > 50 and np.max(delta - phis_[-50:]) < 0:
                 lambda_ *= 0.0
             lambda_[:] = lambda_.clamp(min=0.0, max=None)
 
@@ -402,7 +411,9 @@ def _maxpair(P, threshold=0.):
             idx_tomerge1, idx_tomerge2 = j, i + 1
         M = torch_merge_idx(M, torch.arange(idx_tomerge1, idx_tomerge2))
         m = torch.max(np.abs(M - 0.5) * (M != 0.5) * (torch.abs(M - 0.5) <= threshold))
-    return M[np.ix_(torch.argsort(sigma), torch.argsort(sigma))]
+    M = M[np.ix_(torch.argsort(sigma), torch.argsort(sigma))]
+    #M = return_pairwise_mat(M)
+    return M #M[np.ix_(torch.argsort(sigma), torch.argsort(sigma))]
 
 
 def maxpair(p, torch_all_ranks, n=4, threshold=0.):
@@ -469,6 +480,8 @@ def torch_dist(dist, p_torch1, p_torch2, torch_all_ranks, threshold, dist_type_s
 
 def launch_exp(all_ranks, dist, p_torch, w, delta, thresholds_, epochs, save=True, dist_type_sym=True, norm_type="1",
                nb_simu_training=25, exp_type="unimodal", n_items=4):
+    my_lr_training = 0.5
+
     torch_all_ranks = torch.from_numpy(np.asarray(all_ranks))
     P = pairwise_matrix(p_torch, torch_all_ranks, n=n_items)
     
@@ -495,12 +508,11 @@ def launch_exp(all_ranks, dist, p_torch, w, delta, thresholds_, epochs, save=Tru
             stat_p = merge(p_torch, torch_all_ranks, threshold=threshold, n=n_items)
         logger.info(f"Original proba p = {p_torch} \n and pairwise = {pairwise_matrix(p_torch, torch_all_ranks)} \n and stat origin ={stat_p}")
 
-
         dist_Tp_Tq = lambda _p, _q: torch_dist(dist, _p, _q, torch_all_ranks, threshold=threshold,
                                                dist_type_sym=dist_type_sym, n_items=n_items)
 
         norms, losses, s_, qs_, mean_qs, phis, mean_phi2, lambdas, mean_lambdas, grad_data, freq_phi = approximate_breakdown_function(
-            delta - 1e-6, dist_Tp_Tq, p_torch, epochs=epochs,  lr=0.1, norm_type=norm_type, nb_simu_training=nb_simu_training)
+            delta - 1e-6, dist_Tp_Tq, p_torch, epochs=epochs,  lr=my_lr_training, norm_type=norm_type, nb_simu_training=nb_simu_training)
         dict_res_training = {"norms": norms, "losses": losses, "s_": s_, "qs_": qs_, "mean_qs": mean_qs, "phis": phis,
                              "mean_phi2": mean_phi2, "lambdas": lambdas, "mean_lambdas": mean_lambdas,
                              "grad_data": grad_data, "freq_phi": freq_phi}
@@ -589,9 +601,55 @@ def main_exp_launcher(config):
             w = f"two_untied_mix={mixture_val}_gap={gap_mode}_seed={seed_val}"
 
 
-        elif exp_type == "sushi":
-            p_torch = torch.load("p_torch_sushi.pt")
-            w = f"sushi_seed={seed_val}"
+        elif exp_type == "agh":
+            p_torch = torch.load("p_torch_agh.pt")
+            w = f"agh_seed={seed_val}"
+
+        elif exp_type == "debian":
+            p_torch = torch.load("p_torch_debian.pt")
+            w = f"debian_seed={seed_val}"
+
+        elif exp_type == "netflix3.1":
+            p_torch = torch.load("p_torch_netflix3.1.pt")
+            w = f"netflix3.1_seed={seed_val}"
+        elif exp_type == "netflix4.1":
+            p_torch = torch.load("p_torch_netflix4.1.pt")
+            w = f"netflix4.1_seed={seed_val}"
+        elif exp_type == "netflix4.2":
+            p_torch = torch.load("p_torch_netflix4.3.pt")
+            w = f"netflix4.2_seed={seed_val}"
+        elif exp_type == "netflix4.3":
+            p_torch = torch.load("p_torch_netflix4.3.pt")
+            w = f"netflix4.3_seed={seed_val}"
+        elif exp_type == "netflix4.4":
+            p_torch = torch.load("p_torch_netflix4.4.pt")
+            w = f"netflix4.4_seed={seed_val}"
+        elif exp_type == "netflix4.5":
+            p_torch = torch.load("p_torch_netflix4.5.pt")
+            w = f"netflix4.5_seed={seed_val}"
+        elif exp_type == "netflix4.6":
+            p_torch = torch.load("p_torch_netflix4.6.pt")
+            w = f"netflix4.6_seed={seed_val}"
+        elif exp_type == "netflix4.7":
+            p_torch = torch.load("p_torch_netflix4.7.pt")
+            w = f"netflix4.7_seed={seed_val}"
+
+        elif exp_type == "mecha_turk1":
+            p_torch = torch.load("p_torch_mecha_turk1.pt")
+            w = f"mecha_turk1_seed={seed_val}"
+        elif exp_type == "mecha_turk2":
+            p_torch = torch.load("p_torch_mecha_turk2.pt")
+            w = f"mecha_turk2_seed={seed_val}"
+        elif exp_type == "mecha_turk3":
+            p_torch = torch.load("p_torch_mecha_turk3.pt")
+            w = f"mecha_turk3_seed={seed_val}"
+        elif exp_type == "mecha_turk4":
+            p_torch = torch.load("p_torch_mecha_turk4.pt")
+            w = f"mecha_turk4_seed={seed_val}"
+
+        elif exp_type == "apa1":
+            p_torch = torch.load("p_torch_apa1.pt")
+            w = f"apa1_seed={seed_val}"
 
         # THRESHOLDS
         thresholds_ = torch.tensor(config.thresholds)
